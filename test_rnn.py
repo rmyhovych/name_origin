@@ -1,201 +1,128 @@
 import torch
-
 import random
-
 import matplotlib.pyplot as plt
 
-import os
-import re
-
-import nn
+import aitools
+import data_manager
 
 
-def charOneHot(c, chars: list):
-    oh = torch.zeros(size=(len(chars),))
-    oh[chars.index(c)] = 1
-    return oh
+def word_to_tensor(word: str, chars: list):
+    t = torch.zeros(size=(len(word), len(chars)))
+    for i, c in enumerate(word):
+        t[i][chars.index(c)] = 1.0
+
+    return t
 
 
-def wordToOneHot(word: str, chars: list):
-    return [charOneHot(c, chars) for c in word]
-
-
-def oneHotToWord(oneHot, chars: list):
+def tensor_to_word(t, chars: list):
     w = []
-    for i in oneHot:
+    for i in t:
         m = torch.argmax(i)
         w.append(chars[int(m.item())])
 
     return "".join(w)
 
 
-def getFilepaths(dirname):
-    return [
-        os.path.join(dirname, f)
-        for f in os.listdir(dirname)
-        if os.path.isfile(os.path.join(dirname, f))
+def prepare_data(data_list, size):
+    prepared_data = []
+    for i, entry in enumerate(data_list):
+        random.shuffle(entry[1])
+        prepared_data += [
+            (word_tensor, torch.tensor([i], dtype=torch.long))
+            for word_tensor in entry[1][:size]
+        ]
+
+    random.shuffle(prepared_data)
+    return prepared_data
+
+
+def calculate_accuracy(net, data_list):
+    n_attempts = 0
+    n_correct = 0
+
+    for i, entry in enumerate(data_list):
+        for x in entry[1]:
+            y = net(x)
+            guess = torch.distributions.Categorical(y).sample()
+
+            n_attempts += 1
+            if guess.item() == i:
+                n_correct += 1
+    return float(n_correct) / float(n_attempts)
+
+
+def main():
+    # ---------- HYPERPARAMETERS ---------- #
+
+    N_EPISODES = 150
+    BATCH_SIZE = 30
+
+    LR = 0.005
+    HIDDEN_SIZE = 100
+
+    # ------------------------------------- #
+
+    dm = data_manager.DataManager()
+
+    charlist = dm.get_charlist()
+    data = [
+        [o, [word_to_tensor(w, charlist) for w in dm.get_names(o)]]
+        for o in dm.get_origins()
     ]
 
+    validation_size = 10
 
-def readNameData(dirname):
-    files = getFilepaths(dirname)
-    chars = set()
+    validation_data = []
+    for data_entry in data:
+        random.shuffle(data_entry[1])
+        validation_data.append([data_entry[0], data_entry[1][:validation_size]])
+        data_entry[1] = data_entry[1][validation_size:]
 
-    rawNames = []
-    for label, fname in enumerate(files):
-        lines = []
-        with open(fname, "r", encoding="utf8") as f:
-            lines = f.readlines()
+    datasize = min([len(entry[1]) for entry in data])
 
-        namesInFile = []
-        for nWord in lines:
-            nWord = nWord.lower()
-            nWord = re.sub(r"\W+", "", nWord)
+    # ------------------------------------- #
 
-            for c in nWord:
-                chars.add(c)
+    net = aitools.nn.rnn.NetworkLSTM(
+        len(charlist), HIDDEN_SIZE, len(data), torch.nn.Softmax(dim=0)
+    )
+    optim = torch.optim.Adam(net.parameters(), lr=LR)
+    lossF = torch.nn.functional.cross_entropy
 
-            namesInFile.append(nWord)
+    losses = []
+    accuracies = []
+    try:
+        for episode in range(N_EPISODES):
+            avrg_loss = 0.0
+            n_batches = 0
 
-        rawNames.append(namesInFile)
+            training_data = prepare_data(data, datasize)
+            for batch_start in range(0, len(training_data), BATCH_SIZE):
+                batch = training_data[batch_start : batch_start + BATCH_SIZE]
+                n_batches += 1
 
-    chars = list(chars)
+                cumulative_loss = 0.0
+                for x, label in batch:
+                    y = net(x).view((1, -1))
+                    cumulative_loss += lossF(y, label)
 
-    data = []
+                optim.zero_grad()
+                avrg_loss += cumulative_loss.item() / len(batch)
+                cumulative_loss.backward()
+                optim.step()
 
-    sizePerLang = min(len(l) for l in rawNames)
-    for i, nameList in enumerate(rawNames):
-        for w in nameList[:sizePerLang]:
-            label = torch.zeros(size=(len(files),))
-            label[i] = 1.0
-            data.append((wordToOneHot(w, chars), label))
+            avrg_loss /= n_batches
+            losses.append(avrg_loss)
+            accuracy = calculate_accuracy(net, validation_data)
+            accuracies.append(accuracy)
 
-    return files, chars, data
+            print("{}\t: {} - {}".format(episode, avrg_loss, accuracy))
+    except KeyboardInterrupt:
+        pass
 
-
-def predictName(net, name):
-    net.reset()
-    y = None
-    for charData in name:
-        y = net(charData)
-
-    return y
-
-
-def validateTest(net, data):
-
-    testLoss = 0.0
-    testAccuracy = 0.0
-    for nameData in data:
-        name = nameData[0]
-        label = nameData[1]
-
-        y: torch.tensor = predictName(net, name)
-
-        actualItem = torch.argmax(y).item()
-        labelItem = torch.argmax(label).item()
-        testAccuracy += 1 if actualItem == labelItem else 0
-
-        loss = lossFunction(y, label)
-        testLoss += loss.item()
-
-    return testLoss / len(data), testAccuracy / len(data)
+    plt.plot(losses)
+    plt.plot(accuracies)
+    plt.show()
 
 
 if __name__ == "__main__":
-
-    files, chars, data = readNameData("names")
-
-    net = nn.NetworkLSTM(len(chars), 2 * len(chars), len(files), torch.sigmoid)
-    params = list(net.parameters())
-    # print(params)
-
-    optimizer = torch.optim.Adam(params, lr=0.001)
-    lossFunction = torch.nn.MSELoss()
-
-    random.shuffle(data)
-    dataToUse = data[: int(1 * len(data))]
-
-    trainingSet = dataToUse[: int(0.9 * len(dataToUse))]
-    testSet = dataToUse[len(trainingSet) :]
-
-    print(
-        "dataToUse[{}] trainingSet[{}] testSet[{}]".format(
-            len(dataToUse), len(trainingSet), len(testSet)
-        )
-    )
-
-    nEpisodes = 200
-    batchSize = 20
-
-    losses = []
-    testLosses = []
-    testAccuracies = []
-    for ep in range(nEpisodes):
-        random.shuffle(trainingSet)
-
-        if ep % 10 == 0:
-            print(ep)
-            testLoss, testAccuracy = validateTest(net, testSet)
-            testLosses.append(testLoss)
-            testAccuracies.append(testAccuracy)
-
-        lossAverage = 0.0
-
-        i = 0
-        for i in range(0, len(trainingSet), batchSize):
-            batch = trainingSet[i : i + batchSize]
-
-            optimizer.zero_grad()
-
-            for nameData in batch:
-                name = nameData[0]
-                label = nameData[1]
-
-                y = predictName(net, name)
-
-                loss = lossFunction(y, label)
-                loss.backward(retain_graph=True)
-
-                lossAverage += loss.item()
-
-            optimizer.step()
-
-        losses.append(lossAverage / (i * len(batch)))
-
-    print("\n\n\tTRAINING DATA :")
-
-    loss, accuracy = validateTest(net, trainingSet[:50])
-
-    testingTraining = trainingSet[:30]
-    for nameData in testingTraining:
-        name = nameData[0]
-        label = nameData[1]
-
-        y = predictName(net, name)
-        print(
-            "{} : {}".format(
-                oneHotToWord(name, chars), files[torch.argmax(label).item()]
-            )
-        )
-
-    print("\n\n\tTEST DATA :")
-    for nameData in testSet:
-        name = nameData[0]
-        label = nameData[1]
-
-        y = predictName(net, name)
-        print(
-            "{} : {}".format(
-                oneHotToWord(name, chars), files[torch.argmax(label).item()]
-            )
-        )
-
-    plt.plot(losses)
-    plt.show()
-
-    plt.plot(testLosses)
-    plt.show()
-
-    plt.plot(testAccuracies)
-    plt.show()
+    main()
