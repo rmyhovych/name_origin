@@ -23,14 +23,11 @@ def tensor_to_word(t, chars: list):
     return "".join(w)
 
 
-def prepare_data(data_list, size):
+def prepare_data(data_lists, size):
     prepared_data = []
-    for i, entry in enumerate(data_list):
-        random.shuffle(entry[1])
-        prepared_data += [
-            (word_tensor, torch.tensor([i], dtype=torch.long))
-            for word_tensor in entry[1][:size]
-        ]
+    for data_list in data_lists:
+        random.shuffle(data_list)
+        prepared_data += data_list[:size]
 
     random.shuffle(prepared_data)
     return prepared_data
@@ -40,14 +37,14 @@ def calculate_accuracy(net, data_list):
     n_attempts = 0
     n_correct = 0
 
-    for i, entry in enumerate(data_list):
-        for x in entry[1]:
-            y = net(x)
-            guess = torch.distributions.Categorical(y).sample()
+    for label, x in data_list:
+        y = net(x)
+        guess = torch.distributions.Categorical(y).sample()
 
-            n_attempts += 1
-            if guess.item() == i:
-                n_correct += 1
+        n_attempts += 1
+        if guess.item() == label[0].item():
+            n_correct += 1
+
     return float(n_correct) / float(n_attempts)
 
 
@@ -58,32 +55,36 @@ def main():
     BATCH_SIZE = 30
 
     LR = 0.005
-    HIDDEN_SIZE = 100
+    HIDDEN_SIZE = 500
 
     # ------------------------------------- #
+
+    DEVICE = torch.device("cuda")
 
     dm = data_manager.DataManager()
 
     charlist = dm.get_charlist()
-    data = [
-        [o, [word_to_tensor(w, charlist) for w in dm.get_names(o)]]
-        for o in dm.get_origins()
-    ]
+
+    data = []
+    for i, o in enumerate(dm.get_origins()):
+        label = torch.tensor([i], dtype=torch.long).to(DEVICE)
+        data.append(
+            [(label, word_to_tensor(w, charlist).to(DEVICE)) for w in dm.get_names(o)]
+        )
 
     validation_size = 10
-
     validation_data = []
-    for data_entry in data:
-        random.shuffle(data_entry[1])
-        validation_data.append([data_entry[0], data_entry[1][:validation_size]])
-        data_entry[1] = data_entry[1][validation_size:]
+    for i in range(len(data)):
+        random.shuffle(data[i])
+        validation_data += data[i][:validation_size]
+        data[i] = data[i][validation_size:]
 
-    datasize = min([len(entry[1]) for entry in data])
+    datasize = min([len(entry) for entry in data])
 
     # ------------------------------------- #
 
     net = aitools.nn.rnn.NetworkLSTM(
-        len(charlist), HIDDEN_SIZE, len(data), torch.nn.Softmax(dim=0)
+        len(charlist), HIDDEN_SIZE, len(data), torch.nn.Softmax(dim=0), device=DEVICE
     )
     optim = torch.optim.Adam(net.parameters(), lr=LR)
     lossF = torch.nn.functional.cross_entropy
@@ -101,8 +102,11 @@ def main():
                 n_batches += 1
 
                 cumulative_loss = 0.0
-                for x, label in batch:
-                    y = net(x).view((1, -1))
+                for label, x in batch:
+                    try:
+                        y = net(x).view((1, -1))
+                    except RuntimeError:
+                        print("err")
                     cumulative_loss += lossF(y, label)
 
                 optim.zero_grad()
